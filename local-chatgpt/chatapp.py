@@ -74,8 +74,15 @@ def add_pdf_to_db(pdf_path):
     embeddings = embedding_model.encode(chunks).tolist()
 
     # Add to ChromaDB
+    # for i, chunk in enumerate(chunks):
+    #     collection.add(ids=[str(i)], embeddings=[embeddings[i]], metadatas=[{"text": chunk}])
     for i, chunk in enumerate(chunks):
-        collection.add(ids=[str(i)], embeddings=[embeddings[i]], metadatas=[{"text": chunk}])
+        collection.add(
+            ids=[str(i)], 
+            embeddings=[embeddings[i]], 
+            documents=[chunk],  # ✅ Store actual text here
+            metadatas=[{"source": pdf_path}]  # Optional metadata
+        )
 
 def query_chromadb(query):
     chroma_query_start_time = time.time()
@@ -91,10 +98,15 @@ def query_chromadb(query):
     print(f"Time taken for ChromaDB query: {chroma_query_end_time - chroma_query_start_time} seconds")
     
     # Extract and return the relevant chunks if available
-    if "metadatas" in results and results["metadatas"]:
-        return [metadata.get("text", "") for metadata in results["metadatas"][0]]
+    # if "metadatas" in results and results["metadatas"]:
+    #     return [metadata.get("text", "") for metadata in results["metadatas"][0]]
+    # else:
+    #     print("No 'metadatas' field found in ChromaDB query result.")
+    #     return []
+    if "documents" in results and results["documents"]:
+        return [doc for doc in results["documents"][0] if doc is not None]  # Remove any None values
     else:
-        print("No 'metadatas' field found in ChromaDB query result.")
+        print("No 'documents' field found in ChromaDB query result.")
         return []
 
 
