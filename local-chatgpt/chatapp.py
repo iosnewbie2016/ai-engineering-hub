@@ -8,6 +8,10 @@ import pypdf
 import time
 import asyncio
 from io import BytesIO
+import nltk
+
+# Ensure NLTK sentence tokenizer is available
+nltk.download('punkt')
 
 # Initialize ChromaDB (Persistent DB)
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
@@ -65,12 +69,37 @@ def extract_text_from_pdf(pdf_path):
     print("Text extraction complete")
     return text
 
+def semantic_chunking(text, max_tokens=300):
+    """
+    Splits text into chunks based on sentence boundaries, ensuring each chunk is meaningful.
+    """
+    sentences = nltk.sent_tokenize(text)
+    chunks = []
+    current_chunk = []
+    current_length = 0
+
+    for sentence in sentences:
+        sentence_length = len(sentence.split())  # Count words
+        if current_length + sentence_length > max_tokens:
+            chunks.append(" ".join(current_chunk))
+            current_chunk = []
+            current_length = 0
+        
+        current_chunk.append(sentence)
+        current_length += sentence_length
+    
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))  # Add the last chunk
+
+    return chunks
+
 def add_pdf_to_db(pdf_path):
     """
     Extracts text from a PDF and stores embeddings into ChromaDB.
     """
     text = extract_text_from_pdf(pdf_path)
-    chunks = [text[i : i + 500] for i in range(0, len(text), 500)]  # Chunk the text into parts
+    # chunks = [text[i : i + 500] for i in range(0, len(text), 500)]  # Chunk the text into parts
+    chunks = semantic_chunking(text, max_tokens=300)  # Improved chunking
     embeddings = embedding_model.encode(chunks).tolist()
 
     # Add to ChromaDB
@@ -84,7 +113,10 @@ def add_pdf_to_db(pdf_path):
             metadatas=[{"source": pdf_path}]  # Optional metadata
         )
 
-def query_chromadb(query):
+def query_chromadb(query, relevance_threshold=0.75):
+    """
+    Queries ChromaDB for similar embeddings, filters results, and returns relevant text.
+    """
     chroma_query_start_time = time.time()
     # Generate embedding for the query
     query_embedding = embedding_model.encode([query]).tolist()
@@ -103,11 +135,27 @@ def query_chromadb(query):
     # else:
     #     print("No 'metadatas' field found in ChromaDB query result.")
     #     return []
+
+    # if "documents" in results and results["documents"]:
+    #     return [doc for doc in results["documents"][0] if doc is not None]  # Remove any None values
+    # else:
+    #     print("No 'documents' field found in ChromaDB query result.")
+    #     return []
+
+    # Extract relevant text chunks and scores
+    retrieved_chunks = []
+    scores = results.get("distances", [[]])[0]  # Get similarity scores
     if "documents" in results and results["documents"]:
-        return [doc for doc in results["documents"][0] if doc is not None]  # Remove any None values
-    else:
-        print("No 'documents' field found in ChromaDB query result.")
+        for i, doc in enumerate(results["documents"][0]):
+            if doc is not None and scores[i] >= relevance_threshold:  # Only keep high-relevance chunks
+                retrieved_chunks.append(doc)
+
+    # If no high-confidence results, return an empty list
+    if not retrieved_chunks:
+        print("No highly relevant documents found.")
         return []
+
+    return retrieved_chunks  # Returns a list of relevant text chunks
 
 
 async def stream_ollama_response(messages):
@@ -139,8 +187,26 @@ async def tool(input_message, image=None):
     relevant_text = query_chromadb(input_message)
     
     # Add the relevant text from ChromaDB to the user message
+    # if relevant_text:
+    #     user_message += "\n\nHere are some relevant pieces of text from the document:\n" + "\n".join(relevant_text)
+
+    # Construct a structured prompt to keep responses grounded
     if relevant_text:
-        user_message += "\n\nHere are some relevant pieces of text from the document:\n" + "\n".join(relevant_text)
+        context = "\n\n".join(relevant_text)
+        user_message = (
+            f"You are an AI assistant with access to relevant information from documents.\n\n"
+            f"**Context:**\n{context}\n\n"
+            f"Based on the above context, answer the following question accurately.\n\n"
+            f"**Question:** {input_message}\n"
+            f"**Answer:**"
+        )
+    else:
+        user_message = (
+            f"You are an AI assistant, but no relevant information was found in the documents.\n"
+            f"Do not guess. If you do not know the answer, say so.\n\n"
+            f"**Question:** {input_message}\n"
+            f"**Answer:**"
+        )
 
     interaction.append({"role": "user", "content": user_message, "images": image} if image else {"role": "user", "content": user_message})
 
