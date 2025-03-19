@@ -33,6 +33,19 @@ Click below to watch the demo video of the AI Assistant in action:
 
 [Watch the video](video-demo.mp4)
 
+## New Changes for chromadb
+Installed torch, torchvision, tesseract
+pdfplumber
+
+
+tesseract --version
+pip install torch==1.13.1 torchvision==0.14.1
+
+pip install pytesseract pillow
+Download mistral(If Llama3.2 struggles, test Mistral-7B (ollama pull mistral).)
+
+pip install pdfplumber faiss-cpu sentence-transformers chromadb
+
 ---
 
 ## 📬 Stay Updated with Our Newsletter!
