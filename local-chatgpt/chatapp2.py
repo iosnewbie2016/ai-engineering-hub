@@ -72,15 +72,22 @@ def extract_text_from_pdf(pdf_path):
 
 def semantic_chunking(text, max_tokens=300):
     """
-    Splits text into chunks based on sentence boundaries, ensuring each chunk is meaningful.
+    Splits text into chunks ensuring slide titles and details remain together.
     """
     sentences = nltk.sent_tokenize(text)
     chunks = []
     current_chunk = []
     current_length = 0
 
+    previous_sentence = ""
+
     for sentence in sentences:
         sentence_length = len(sentence.split())  # Count words
+
+        # If the previous sentence looks like a title (shorter text, capitalization)
+        if len(previous_sentence.split()) <= 8 and previous_sentence.istitle():
+            sentence = previous_sentence + " " + sentence  # Merge title with next sentence
+
         if current_length + sentence_length > max_tokens:
             chunks.append(" ".join(current_chunk))
             current_chunk = []
@@ -88,10 +95,24 @@ def semantic_chunking(text, max_tokens=300):
         
         current_chunk.append(sentence)
         current_length += sentence_length
+        previous_sentence = sentence  # Store last sentence for title merging
 
     if current_chunk:
         chunks.append(" ".join(current_chunk))  # Add the last chunk
 
+    return chunks
+
+def sliding_window_chunking(text, chunk_size=300, overlap=50):
+    """
+    Splits text into overlapping chunks using a sliding window approach.
+    """
+    words = text.split()
+    chunks = []
+    
+    for i in range(0, len(words), chunk_size - overlap):
+        chunk = words[i:i + chunk_size]
+        chunks.append(" ".join(chunk))
+    
     return chunks
 
 def add_pdf_to_db(pdf_path):
@@ -99,7 +120,8 @@ def add_pdf_to_db(pdf_path):
     global index, metadata_store  # Use global variables
 
     text = extract_text_from_pdf(pdf_path)
-    chunks = semantic_chunking(text, max_tokens=300)
+    # chunks = semantic_chunking(text, max_tokens=300)
+    chunks = sliding_window_chunking(text, chunk_size=300, overlap=50)
     embeddings = embedding_model.encode(chunks)
 
     # ✅ Add to FAISS (Replacing ChromaDB)
@@ -110,26 +132,39 @@ def add_pdf_to_db(pdf_path):
         metadata_store[i] = {"text": chunk, "source": pdf_path}
 
 def query_faiss(query, relevance_threshold=0.75):
-    """Queries FAISS for similar embeddings and returns relevant text."""
+    """Queries FAISS for similar embeddings and returns relevant text.
+    Rank Retrieved Chunks by Query Similarity
+    Instead of just returning the FAISS top results, we rerank them based on how well they match the query.
+    """
     faiss_query_start_time = time.time()
     query_embedding = embedding_model.encode([query]).astype(np.float32)
-    
-    # ✅ Perform similarity search in FAISS
-    D, I = index.search(query_embedding, 3)  # Get top 3 results
-
+	
+	# ✅ Perform similarity search in FAISS
+    D, I = index.search(query_embedding, 5)   # Get top 3 results  
     retrieved_chunks = []
+    retrieved_embeddings = []
+
     for i, score in zip(I[0], D[0]):
         if i != -1 and score >= relevance_threshold:
-            retrieved_chunks.append(metadata_store[i]["text"])
+            chunk_text = metadata_store.get(i, {}).get("text", "")
+            retrieved_chunks.append(chunk_text)
+            retrieved_embeddings.append(embedding_model.encode([chunk_text])[0])
 
     if not retrieved_chunks:
         print("No highly relevant documents found.")
         return []
-    
+
+    # ✅ Compute cosine similarity between query and retrieved chunks
+    retrieved_embeddings = np.array(retrieved_embeddings)
+    similarities = cosine_similarity(query_embedding, retrieved_embeddings)[0]
+
+    # ✅ Rank results based on cosine similarity
+    ranked_chunks = [chunk for _, chunk in sorted(zip(similarities, retrieved_chunks), reverse=True)]
+
     faiss_end_time = time.time()
     print(f"Time taken for FAISS query: {faiss_end_time - faiss_query_start_time} seconds")
 
-    return retrieved_chunks  # Returns a list of relevant text chunks
+    return ranked_chunks[:3]  # Return top 3 ranked chunks
 
 async def stream_ollama_response(messages):
     """Runs Ollama chat in a separate thread to avoid async generator issues."""
@@ -157,11 +192,11 @@ async def tool(input_message, image=None):
     if relevant_text:
         context = "\n\n".join(relevant_text)
         user_message = (
-            f"You are an AI assistant with access to relevant information from documents.\n\n"
-            f"**Context:**\n{context}\n\n"
+            f"You are an AI assistant with access to document slides.\n\n"
+            f"**Context from the slides:**\n{context}\n\n"
             f"Based on the above context, answer the following question accurately.\n\n"
             f"**Question:** {input_message}\n"
-            f"**Answer:**"
+            f"**Answer:** Use the context above to answer precisely. If a title is mentioned, return its corresponding details."
         )
     else:
         user_message = (
