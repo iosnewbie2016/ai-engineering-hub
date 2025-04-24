@@ -1,0 +1,342 @@
+import pytesseract
+from PIL import Image
+import pdfplumber
+import faiss  # ✅ Changed from ChromaDB to FAISS
+import chainlit as cl
+import ollama
+import time
+import asyncio
+from io import BytesIO
+import nltk
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import SentenceTransformer
+import sqlite3
+import re
+
+# Ensure NLTK sentence tokenizer is available
+nltk.download('punkt')
+
+# Load the embedding model (same as before)
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+MODEL_NAME = "llama3.2"
+
+# ✅ Initialize FAISS (Replacing ChromaDB)
+dimension = 384  # Embedding size for MiniLM-L6-v2
+index = faiss.IndexFlatL2(dimension)  # L2 Distance based FAISS index
+metadata_store = {}  # Dictionary to store text metadata (since FAISS does not store metadata)
+
+DB_PATH = "tennisschedule.db"  # Path to SQLite database
+
+import sqlite3
+
+def query_sqlite(db_path, query):
+    """Executes a SELECT query against a local SQLite database."""
+    results = []
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        column_names = [description[0] for description in cursor.description]
+        # for row in rows:
+        #     result_dict = dict(zip(column_names, row))
+        #     results.append(result_dict)
+        conn.close()
+        return "\n".join([str(dict(zip(column_names, row))) for row in rows])
+    except Exception as e:
+        print(f"SQLite error: {e}")
+    return results
+
+
+@cl.on_chat_start
+async def start_chat():
+    """Initializes the chat session and sends the welcome message."""
+    cl.user_session.set(
+        "interaction",
+        [{"role": "system", "content": "You are a helpful assistant."}]
+    )
+    
+    start_message = f"Hello, I'm your 100% local alternative to ChatGPT running on {MODEL_NAME}. How can I help you today?"
+    msg = cl.Message(content="")
+    
+    for token in start_message:
+        await msg.stream_token(token)
+    
+    await msg.send()
+    
+def extract_text_from_pdf(pdf_path):
+    """
+    Extracts text from a PDF using pdfplumber, including OCR for images.
+    """
+    print(f"Reading from pdf file: {pdf_path}")
+    text = ""
+
+    with pdfplumber.open(pdf_path) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            # Extract text from page
+            page_text = page.extract_text() if page.extract_text() else ""
+            text += page_text
+            print(f"Extracted text from page {page_num + 1}")
+            
+            # Handle images on pages (OCR processing)
+            print(f"Number of images on page {page_num + 1}: {len(page.images)}")
+            for img in page.images:
+                print(img)
+                # Extract image from the stream
+                image_data = img['stream'].get_data()  # Get the raw image data
+                image = Image.open(BytesIO(image_data))  # Open image from byte stream
+                
+                # Use OCR to extract text from image
+                image_text = pytesseract.image_to_string(image)
+                text += "\n" + image_text  # Append OCR result to extracted text
+                print(f"Extracted text from image on page {page_num + 1}")
+    
+    print("Text extraction complete")
+    return text
+
+def semantic_chunking(text, max_tokens=300):
+    """
+    Splits text into chunks ensuring slide titles and details remain together.
+    """
+    sentences = nltk.sent_tokenize(text)
+    chunks = []
+    current_chunk = []
+    current_length = 0
+
+    previous_sentence = ""
+
+    for sentence in sentences:
+        sentence_length = len(sentence.split())  # Count words
+
+        # If the previous sentence looks like a title (shorter text, capitalization)
+        if len(previous_sentence.split()) <= 8 and previous_sentence.istitle():
+            sentence = previous_sentence + " " + sentence  # Merge title with next sentence
+
+        if current_length + sentence_length > max_tokens:
+            chunks.append(" ".join(current_chunk))
+            current_chunk = []
+            current_length = 0
+        
+        current_chunk.append(sentence)
+        current_length += sentence_length
+        previous_sentence = sentence  # Store last sentence for title merging
+
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))  # Add the last chunk
+
+    return chunks
+
+def sliding_window_chunking(text, chunk_size=300, overlap=50):
+    """
+    Splits text into overlapping chunks using a sliding window approach.
+    """
+    words = text.split()
+    chunks = []
+    
+    for i in range(0, len(words), chunk_size - overlap):
+        chunk = words[i:i + chunk_size]
+        chunks.append(" ".join(chunk))
+    
+    return chunks
+
+def add_pdf_to_db(pdf_path):
+    """Extracts text from a PDF and stores embeddings into FAISS."""
+    global index, metadata_store  # Use global variables
+
+    text = extract_text_from_pdf(pdf_path)
+    # chunks = semantic_chunking(text, max_tokens=300)
+    chunks = sliding_window_chunking(text, chunk_size=300, overlap=50)
+    embeddings = embedding_model.encode(chunks)
+
+    # ✅ Add to FAISS (Replacing ChromaDB)
+    index.add(np.array(embeddings, dtype=np.float32))
+
+    # ✅ Store metadata separately
+    for i, chunk in enumerate(chunks):
+        metadata_store[i] = {"text": chunk, "source": pdf_path}
+
+def query_faiss(query, relevance_threshold=0.75):
+    """Queries FAISS for similar embeddings and returns relevant text.
+    Rank Retrieved Chunks by Query Similarity
+    Instead of just returning the FAISS top results, we rerank them based on how well they match the query.
+    """
+    faiss_query_start_time = time.time()
+    query_embedding = embedding_model.encode([query]).astype(np.float32)
+	
+	# ✅ Perform similarity search in FAISS
+    D, I = index.search(query_embedding, 5)   # Get top 3 results  
+    retrieved_chunks = []
+    retrieved_embeddings = []
+
+    for i, score in zip(I[0], D[0]):
+        if i != -1 and score >= relevance_threshold:
+            chunk_text = metadata_store.get(i, {}).get("text", "")
+            retrieved_chunks.append(chunk_text)
+            retrieved_embeddings.append(embedding_model.encode([chunk_text])[0])
+
+    if not retrieved_chunks:
+        print("No highly relevant documents found.")
+        return []
+
+    # ✅ Compute cosine similarity between query and retrieved chunks
+    retrieved_embeddings = np.array(retrieved_embeddings)
+    similarities = cosine_similarity(query_embedding, retrieved_embeddings)[0]
+
+    # ✅ Rank results based on cosine similarity
+    ranked_chunks = [chunk for _, chunk in sorted(zip(similarities, retrieved_chunks), reverse=True)]
+
+    faiss_end_time = time.time()
+    print(f"Time taken for FAISS query: {faiss_end_time - faiss_query_start_time} seconds")
+
+    return ranked_chunks[:3]  # Return top 3 ranked chunks
+
+# async def stream_ollama_response(messages):
+#     """Runs Ollama chat in a separate thread to avoid async generator issues."""
+#     loop = asyncio.get_running_loop()
+#     return await loop.run_in_executor(None, lambda: ollama.chat(model=MODEL_NAME, messages=messages, stream=True))
+
+async def stream_ollama_response(messages):
+    """Runs Ollama chat in a separate thread and yields streamed responses asynchronously."""
+    loop = asyncio.get_running_loop()
+    response_generator = await loop.run_in_executor(None, lambda: ollama.chat(model=MODEL_NAME, messages=messages, stream=True))
+
+    for chunk in response_generator:
+        yield chunk
+
+@cl.step(type="tool")
+async def process_file_upload(file_path):
+    """Processes the uploaded PDF and stores embeddings in FAISS."""
+    print("Starting file upload process...")
+    add_pdf_to_db(file_path)
+    await cl.Message(content="File processed and stored in FAISS. You can now chat with the assistant.").send()
+
+@cl.step(type="tool")
+async def tool(input_message, image=None):
+    """Handles user input and retrieves relevant context from FAISS."""
+    start_time = time.time()
+    
+    interaction = cl.user_session.get("interaction")
+    user_message = input_message
+    print(f"User message: {user_message}")
+
+    # ✅ Query FAISS instead of ChromaDB
+    relevant_text = query_faiss(input_message)
+
+    if relevant_text:
+        context = "\n\n".join(relevant_text)
+        user_message = (
+            f"You are a helpful AI assistant with access to both static document slides and a live SQLite database.\n\n"
+            f"**Context from the slides:**\n"
+            f"{context}\n\n"
+            f"The SQLite database has one table:\n"
+            f"`enrollment(program_name TEXT, day_of_week TEXT, enrolled INTEGER, capacity INTEGER)`\n\n"
+            f"When users ask about a program, use the PDF context to provide descriptive details and generate SQL queries "
+            f"to fetch real-time information like how many people are enrolled and how many slots are available. "
+            f"Use the `program_name` from the document format, which looks like this: "
+            f"\"Program name – Recommended Age group\" (e.g., \"U6 Tennis – Ages 4 & 5\").\n\n"
+            f"Please return the program name and the recommended age group as two separate fields. "
+            f"Format the response like this:  "
+            f"Program Name: <name of the program>  "
+            f"Recommended Age Group: <recommended ages>"  
+            f"For example:  "
+            f"Program Name: U6 Tennis"  
+            f"Recommended Age Group: Ages 4 & 5\n\n"
+            f"If needed, include the SQL query (e.g., starting with SELECT) directly in your answer. "
+            f"We will detect it and automatically run it to augment your reply with live results.\n\n"
+            f"**Question:** {input_message}\n"
+            f"**Answer:** Combine both the document context and live database data to provide a comprehensive and accurate response."
+        )
+    else:
+        user_message = (
+            f"You are an AI assistant, but no relevant information was found in the documents.\n"
+            f"Do not guess. If you do not know the answer, say so.\n\n"
+            f"**Question:** {input_message}\n"
+            f"**Answer:**"
+        )
+
+    interaction.append({"role": "user", "content": user_message, "images": image} if image else {"role": "user", "content": user_message})
+
+    # msg = cl.Message(content="")
+    
+    try:
+        full_response = ""
+        async for chunk in stream_ollama_response(interaction):
+            # print("Response Chunk:", chunk["message"]["content"])
+            full_response += chunk["message"]["content"]
+            # await msg.stream_token(chunk["message"]["content"])
+
+        # interaction.append({"role": "assistant", "content": msg.content})
+        # await msg.send()
+
+        # Find SELECT SQL query
+        sql_match = re.search(r"(SELECT\s.+?;)", full_response, re.IGNORECASE | re.DOTALL)
+        modified_response = full_response
+        print("Is there an SQL needed?", sql_match)
+
+        if sql_match:
+            query = sql_match.group(1).strip()
+            try:
+                # Execute the SQL query against the SQLite database
+                result = query_sqlite(DB_PATH, query)
+                print("SQL Result:", result)
+                result_text = f"\n\n📊 **Live Data Result** for `{query}`:\n```\n{result}\n```"
+
+                # Inject the result right after the SQL in the response
+                modified_response = full_response.replace(query, f"{query}{result_text}")
+
+            except Exception as e:
+                result_text = f"\n\n❌ Error running query `{query}`:\n```\n{str(e)}\n```"
+                modified_response = full_response.replace(query, f"{query}{result_text}")
+
+        print("Modified Response:", modified_response)
+        await cl.Message(content=modified_response).send()
+        interaction.append({"role": "assistant", "content": modified_response})
+        # msg.stream_token(modified_response)
+        # msg.content = modified_response
+        # await msg.send()
+    
+    except Exception as e:
+        await cl.Message(content=f"Error: {str(e)}").send()
+
+    end_time = time.time()
+    print(f"Time taken for Ollama processing: {end_time - start_time} seconds")
+
+@cl.on_message
+async def main(message: cl.Message):
+    """Processes user messages and interacts with FAISS."""
+    overall_start_time = time.time()
+    
+    pdf_files = [file for file in message.elements if file.mime == "application/pdf"]
+
+    if pdf_files:
+        await process_file_upload(pdf_files[0].path)
+        return
+
+    try:
+        await asyncio.wait_for(tool(message.content), timeout=300)
+    except asyncio.TimeoutError:
+        await cl.Message(content="The model took too long to respond. Please try again later.").send()
+        return
+
+    overall_end_time = time.time()
+    print(f"Overall time taken for the entire process: {overall_end_time - overall_start_time} seconds")
+
+def view_faiss_contents():
+    """
+    Retrieves and prints contents from the FAISS index.
+    """
+    global faiss_index, stored_texts  # Ensure access to the stored text and metadata dictionary
+    
+    if not stored_texts:
+        print("FAISS index is empty.")
+        return
+
+    print("Stored text chunks in FAISS:")
+    for idx, text in stored_texts.items():
+        print(f"ID {idx}: {text}")
+
+# Run the Chainlit application
+# cl.run()
+
