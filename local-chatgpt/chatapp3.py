@@ -232,22 +232,35 @@ async def tool(input_message, image=None):
             f"{context}\n\n"
             f"The SQLite database has one table:\n"
             f"`enrollment(program_name TEXT, day_of_week TEXT, enrolled INTEGER, capacity INTEGER)`\n\n"
+
             f"When users ask about a program, use the PDF context to provide descriptive details and generate SQL queries "
-            f"to fetch real-time information like how many people are enrolled and how many slots are available. "
-            f"Use the `program_name` from the document format, which looks like this: "
-            f"\"Program name – Recommended Age group\" (e.g., \"U6 Tennis – Ages 4 & 5\").\n\n"
-            f"Please return the program name and the recommended age group as two separate fields. "
-            f"Format the response like this:  "
-            f"Program Name: <name of the program>  "
-            f"Recommended Age Group: <recommended ages>"  
-            f"For example:  "
-            f"Program Name: U6 Tennis"  
+            f"to fetch real-time information like how many people are enrolled and how many slots are available.\n\n"
+
+            f"**SQL construction guidelines:**\n"
+            f"- Extract the program name only (e.g., 'U8 Tennis') from the full format: "
+            f"\"Program name – Recommended Age group\" (e.g., \"U8 Tennis – Ages 6 & 7\").\n"
+            f"- If the user's question includes a specific day (e.g., 'on Thursday'), filter the query using `day_of_week` as well.\n"
+            f"- The database stores day names in short form: 'Mon', 'Tues', 'Wed', 'Thurs', 'Fri', 'Sat', 'Sun'.\n"
+            f"- Example query without day filter:\n"
+            f"  `SELECT * FROM enrollment WHERE program_name = 'U8 Tennis';`\n"
+            f"- Example query with day filter:\n"
+            f"  `SELECT * FROM enrollment WHERE program_name = 'U8 Tennis' AND day_of_week = 'Thurs';`\n\n"
+
+            f"Please return the program name and the recommended age group as two separate fields.\n"
+            f"Format the response like this:\n"
+            f"Program Name: <name of the program>\n"
+            f"Recommended Age Group: <recommended ages>\n"
+            f"For example:\n"
+            f"Program Name: U6 Tennis\n"
             f"Recommended Age Group: Ages 4 & 5\n\n"
+
             f"If needed, include the SQL query (e.g., starting with SELECT) directly in your answer. "
             f"We will detect it and automatically run it to augment your reply with live results.\n\n"
+
             f"**Question:** {input_message}\n"
             f"**Answer:** Combine both the document context and live database data to provide a comprehensive and accurate response."
         )
+
     else:
         user_message = (
             f"You are an AI assistant, but no relevant information was found in the documents.\n"
@@ -272,6 +285,7 @@ async def tool(input_message, image=None):
 
         # Find SELECT SQL query
         sql_match = re.search(r"(SELECT\s.+?;)", full_response, re.IGNORECASE | re.DOTALL)
+        full_response = full_response.encode("utf-8", errors="ignore").decode()
         modified_response = full_response
         print("Is there an SQL needed?", sql_match)
 
@@ -281,7 +295,8 @@ async def tool(input_message, image=None):
                 # Execute the SQL query against the SQLite database
                 result = query_sqlite(DB_PATH, query)
                 print("SQL Result:", result)
-                result_text = f"\n\n📊 **Live Data Result** for `{query}`:\n```\n{result}\n```"
+                # result_text = f"\n\n📊 **Live Data Result** for `{query}`:\n```\n{result}\n```"
+                result_text = f"\n\n📊 **Live Data Result** for `{query}`:\n```text\n{str(result)}\n```"
 
                 # Inject the result right after the SQL in the response
                 modified_response = full_response.replace(query, f"{query}{result_text}")
@@ -293,6 +308,7 @@ async def tool(input_message, image=None):
         print("Modified Response:", modified_response)
         await cl.Message(content=modified_response).send()
         interaction.append({"role": "assistant", "content": modified_response})
+        cl.user_session.set("interaction", interaction)
         # msg.stream_token(modified_response)
         # msg.content = modified_response
         # await msg.send()
