@@ -241,3 +241,54 @@ final_features, history = multi_step_backward_elimination(
     categorical_features,
     max_step_size=2
 )
+
+import pandas as pd
+import lightgbm as lgb
+
+def feature_audit(train_df, test_df, target_col, features):
+    # Train on train set
+    train_model = lgb.LGBMRegressor(random_state=42)
+    train_model.fit(train_df[features], train_df[target_col])
+    train_importance = pd.Series(train_model.feature_importances_, index=features)
+
+    # Train on test set (pretend we "know" test target for audit purposes)
+    test_model = lgb.LGBMRegressor(random_state=42)
+    test_model.fit(test_df[features], test_df[target_col])
+    test_importance = pd.Series(test_model.feature_importances_, index=features)
+
+    # Compare
+    audit_df = pd.DataFrame({
+        "train_importance": train_importance,
+        "test_importance": test_importance
+    })
+    audit_df["importance_diff"] = audit_df["train_importance"] - audit_df["test_importance"]
+    audit_df["flag_for_removal"] = (audit_df["train_importance"] > audit_df["train_importance"].mean()) & \
+                                   (audit_df["test_importance"] < audit_df["test_importance"].mean())
+    return audit_df.sort_values("importance_diff", ascending=False)
+
+# Example usage
+audit_results = feature_audit(train_df, test_df, "transactions", features)
+print(audit_results[audit_results["flag_for_removal"]])
+
+
+# Detect and mitigate shift
+from scipy.stats import ks_2samp
+import numpy as np
+
+def detect_distribution_shift(train_df, test_df, features, threshold=0.1):
+    shift_report = {}
+    for f in features:
+        ks_stat, p_value = ks_2samp(train_df[f].dropna(), test_df[f].dropna())
+        shift_report[f] = {"ks_stat": ks_stat, "p_value": p_value, "shifted": p_value < threshold}
+    return shift_report
+
+# Example usage
+features = ["trend_by_hour", "residual_by_dow", "rolling_24h_mean", "rolling_7d_std"]
+shift_report = detect_distribution_shift(train_df, test_df, features)
+print({f: r for f, r in shift_report.items() if r["shifted"]})
+
+# Mitigation example: Clip extreme values
+for f in features:
+    low, high = np.percentile(train_df[f].dropna(), [1, 99])
+    train_df[f] = np.clip(train_df[f], low, high)
+    test_df[f] = np.clip(test_df[f], low, high)
