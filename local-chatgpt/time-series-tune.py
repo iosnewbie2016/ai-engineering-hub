@@ -292,3 +292,54 @@ for f in features:
     low, high = np.percentile(train_df[f].dropna(), [1, 99])
     train_df[f] = np.clip(train_df[f], low, high)
     test_df[f] = np.clip(test_df[f], low, high)
+
+# 
+def single_pass_feature_audit(X_train, y_train, X_valid, y_valid, categorical_features, shap_sample=200):
+    # Baseline model
+    baseline_rmse, baseline_model = evaluate_model(X_train, y_train, X_valid, y_valid, categorical_features)
+    print(f"\nBaseline RMSE with all features: {baseline_rmse:.4f}")
+
+    # Baseline SHAP values
+    explainer = shap.TreeExplainer(baseline_model)
+    shap_values_baseline = explainer.shap_values(X_valid.sample(shap_sample, random_state=42))
+    mean_abs_shap_baseline = np.abs(shap_values_baseline).mean(axis=0)
+    shap_baseline_df = pd.DataFrame({
+        "feature": X_train.columns,
+        "shap_importance": mean_abs_shap_baseline
+    }).set_index("feature")
+
+    results = []
+    for feature in X_train.columns:
+        # Remove feature and retrain
+        X_train_reduced = X_train.drop(columns=[feature])
+        X_valid_reduced = X_valid.drop(columns=[feature])
+
+        rmse, model = evaluate_model(X_train_reduced, y_train, X_valid_reduced, y_valid, categorical_features)
+        delta_rmse = rmse - baseline_rmse
+
+        # SHAP importance without this feature
+        explainer = shap.TreeExplainer(model)
+        shap_values_reduced = explainer.shap_values(X_valid_reduced.sample(shap_sample, random_state=42))
+        mean_abs_shap_reduced = np.abs(shap_values_reduced).mean(axis=0)
+        shap_reduced_df = pd.DataFrame({
+            "feature": X_train_reduced.columns,
+            "shap_importance": mean_abs_shap_reduced
+        }).set_index("feature")
+
+        # Check how the *remaining* features' importance changes
+        importance_drop = (
+            shap_baseline_df.loc[shap_reduced_df.index, "shap_importance"] -
+            shap_reduced_df["shap_importance"]
+        ).mean()
+
+        results.append({
+            "feature": feature,
+            "rmse_removed": rmse,
+            "delta_rmse": delta_rmse,
+            "avg_importance_drop": importance_drop
+        })
+
+    results_df = pd.DataFrame(results).sort_values("delta_rmse")
+    results_df["harmful_rmse"] = results_df["delta_rmse"] < 0
+    results_df["importance_drop_flag"] = results_df["avg_importance_drop"] > 0
+    return results_df
