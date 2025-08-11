@@ -1,0 +1,187 @@
+import lightgbm as lgb
+import pandas as pd
+import numpy as np
+from sklearn.metrics import mean_squared_error
+
+def time_series_feature_elimination(X_train, y_train, X_valid, y_valid, categorical_features=None):
+    """
+    Sequential backward elimination for time series data.
+    Drops one feature at a time and measures RMSE change.
+    """
+
+    # Baseline model with all features
+    model_all = lgb.LGBMRegressor(
+        n_estimators=500,
+        learning_rate=0.05,
+        random_state=42
+    )
+    model_all.fit(
+        X_train, y_train,
+        eval_set=[(X_valid, y_valid)],
+        eval_metric='rmse',
+        categorical_feature=categorical_features,
+        verbose=False
+    )
+
+    y_pred_all = model_all.predict(X_valid)
+    baseline_rmse = mean_squared_error(y_valid, y_pred_all, squared=False)
+    print(f"\nBaseline RMSE with all features: {baseline_rmse:.4f}")
+
+    results = []
+
+    for feature in X_train.columns:
+        print(f"Testing without feature: {feature}")
+
+        X_train_reduced = X_train.drop(columns=[feature])
+        X_valid_reduced = X_valid.drop(columns=[feature])
+
+        model = lgb.LGBMRegressor(
+            n_estimators=500,
+            learning_rate=0.05,
+            random_state=42
+        )
+        model.fit(
+            X_train_reduced, y_train,
+            eval_set=[(X_valid_reduced, y_valid)],
+            eval_metric='rmse',
+            categorical_feature=[f for f in categorical_features if f != feature] if categorical_features else None,
+            verbose=False
+        )
+
+        y_pred = model.predict(X_valid_reduced)
+        rmse = mean_squared_error(y_valid, y_pred, squared=False)
+        delta = rmse - baseline_rmse
+
+        results.append({
+            "feature": feature,
+            "rmse": rmse,
+            "delta_rmse": delta
+        })
+
+    results_df = pd.DataFrame(results).sort_values("delta_rmse")
+    return results_df
+
+# Example usage:
+# Assume df has MultiIndex (datetime, AppName) and we have already split into train/test
+# Drop index safely
+X = df.drop(columns=["transactions"])  # target column
+y = df["transactions"]
+
+# Split preserving time order
+train_size = int(len(df) * 0.8)
+X_train, X_valid = X.iloc[:train_size], X.iloc[train_size:]
+y_train, y_valid = y.iloc[:train_size], y.iloc[train_size:]
+
+categorical_features = ["hour_of_day", "day_of_week"]  # your known cat columns
+
+results_df = time_series_feature_elimination(X_train, y_train, X_valid, y_valid, categorical_features)
+print(results_df)
+
+import lightgbm as lgb
+import pandas as pd
+import numpy as np
+from sklearn.metrics import mean_squared_error
+
+def evaluate_model(X_train, y_train, X_valid, y_valid, categorical_features):
+    """Train LightGBM and return RMSE on validation."""
+    model = lgb.LGBMRegressor(
+        n_estimators=500,
+        learning_rate=0.05,
+        random_state=42
+    )
+    model.fit(
+        X_train, y_train,
+        eval_set=[(X_valid, y_valid)],
+        eval_metric='rmse',
+        categorical_feature=[f for f in categorical_features if f in X_train.columns],
+        verbose=False
+    )
+    y_pred = model.predict(X_valid)
+    rmse = mean_squared_error(y_valid, y_pred, squared=False)
+    return rmse
+
+
+def single_pass_feature_elimination(X_train, y_train, X_valid, y_valid, categorical_features):
+    """One pass — test removing each feature individually."""
+    baseline_rmse = evaluate_model(X_train, y_train, X_valid, y_valid, categorical_features)
+    print(f"\nBaseline RMSE with all features: {baseline_rmse:.4f}")
+
+    results = []
+    for feature in X_train.columns:
+        X_train_reduced = X_train.drop(columns=[feature])
+        X_valid_reduced = X_valid.drop(columns=[feature])
+
+        rmse = evaluate_model(X_train_reduced, y_train, X_valid_reduced, y_valid, categorical_features)
+        delta = rmse - baseline_rmse
+
+        results.append({
+            "feature": feature,
+            "rmse": rmse,
+            "delta_rmse": delta
+        })
+
+    results_df = pd.DataFrame(results).sort_values("delta_rmse")
+    return results_df
+
+
+def sequential_backward_elimination(X_train, y_train, X_valid, y_valid, categorical_features):
+    """Full loop — remove worst offender iteratively until RMSE stops improving."""
+    current_features = list(X_train.columns)
+    baseline_rmse = evaluate_model(X_train, y_train, X_valid, y_valid, categorical_features)
+    print(f"\nInitial RMSE: {baseline_rmse:.4f} with {len(current_features)} features")
+
+    improved = True
+    history = []
+
+    while improved and len(current_features) > 1:
+        improved = False
+        best_rmse = baseline_rmse
+        worst_feature = None
+
+        for feature in current_features:
+            X_train_reduced = X_train[current_features].drop(columns=[feature])
+            X_valid_reduced = X_valid[current_features].drop(columns=[feature])
+
+            rmse = evaluate_model(X_train_reduced, y_train, X_valid_reduced, y_valid, categorical_features)
+
+            if rmse < best_rmse - 1e-4:  # tiny tolerance to avoid random fluctuation
+                best_rmse = rmse
+                worst_feature = feature
+
+        if worst_feature:
+            print(f"Removing '{worst_feature}' improved RMSE from {baseline_rmse:.4f} → {best_rmse:.4f}")
+            current_features.remove(worst_feature)
+            baseline_rmse = best_rmse
+            improved = True
+            history.append((worst_feature, best_rmse))
+        else:
+            print("No further improvement found.")
+            break
+
+    return current_features, history
+
+
+# ==== Example Usage ====
+# Drop index columns before passing to this script
+# df.index is MultiIndex (datetime, AppName)
+# target = df["transactions"]
+# features = df.drop(columns=["transactions"])
+
+# Split preserving order
+# train_size = int(len(df) * 0.8)
+# X_train, X_valid = features.iloc[:train_size], features.iloc[train_size:]
+# y_train, y_valid = target.iloc[:train_size], target.iloc[train_size:]
+
+# Known categorical columns
+# categorical_features = ["hour_of_day", "day_of_week"]
+
+# Step 1 — single pass check
+# single_pass_results = single_pass_feature_elimination(X_train, y_train, X_valid, y_valid, categorical_features)
+# print(single_pass_results)
+
+# Step 2 — full backward elimination
+# final_features, elimination_history = sequential_backward_elimination(X_train, y_train, X_valid, y_valid, categorical_features)
+# print("\nFinal selected features:", final_features)
+# print("Elimination history:", elimination_history)
+
+
