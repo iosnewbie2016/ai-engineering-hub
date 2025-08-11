@@ -185,3 +185,59 @@ def sequential_backward_elimination(X_train, y_train, X_valid, y_valid, categori
 # print("Elimination history:", elimination_history)
 
 
+
+from itertools import combinations
+
+def multi_step_backward_elimination(
+    X_train, y_train, X_valid, y_valid,
+    categorical_features,
+    max_step_size=2
+):
+    """
+    Multi-step lookahead backward elimination.
+    Can remove 1..max_step_size features per step.
+    """
+    current_features = list(X_train.columns)
+    baseline_rmse = evaluate_model(X_train, y_train, X_valid, y_valid, categorical_features)
+    print(f"\nInitial RMSE: {baseline_rmse:.4f} with {len(current_features)} features")
+
+    improved = True
+    history = []
+
+    while improved and len(current_features) > 1:
+        improved = False
+        best_rmse = baseline_rmse
+        best_combo = None
+
+        # Try removing 1..max_step_size features at a time
+        step_size_limit = min(max_step_size, len(current_features) - 1)
+        for step_size in range(1, step_size_limit + 1):
+            for combo in combinations(current_features, step_size):
+                reduced_features = [f for f in current_features if f not in combo]
+                X_train_reduced = X_train[reduced_features]
+                X_valid_reduced = X_valid[reduced_features]
+
+                rmse = evaluate_model(X_train_reduced, y_train, X_valid_reduced, y_valid, categorical_features)
+
+                if rmse < best_rmse - 1e-4:
+                    best_rmse = rmse
+                    best_combo = combo
+
+        if best_combo:
+            print(f"Removing {best_combo} improved RMSE from {baseline_rmse:.4f} → {best_rmse:.4f}")
+            current_features = [f for f in current_features if f not in best_combo]
+            baseline_rmse = best_rmse
+            improved = True
+            history.append((best_combo, best_rmse))
+        else:
+            print("No further improvement found.")
+            break
+
+    return current_features, history
+
+
+final_features, history = multi_step_backward_elimination(
+    X_train, y_train, X_valid, y_valid,
+    categorical_features,
+    max_step_size=2
+)
