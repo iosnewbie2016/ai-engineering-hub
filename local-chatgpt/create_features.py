@@ -328,3 +328,192 @@ def create_features(df, date_col='datetime', lag_days=4, last_known_date=None):
             df[col] = historical_fill(df[col], hist_mask)
 
     return df
+
+
+#V4
+# Hourly-level features
+for lag in [1, 24, 168]:  # 1h, 1d, 1w
+    df[f"lag_{lag}h"] = (
+        df.groupby("AppName", group_keys=False)
+          .apply(lambda g: g["transactions"].shift(lag))
+    )
+
+for window in [3, 6, 24, 72, 168]:  # hours
+    # Rolling mean
+    df[f"roll_mean_{window}h"] = (
+        df.groupby("AppName", group_keys=False)
+          .apply(lambda g: g["transactions"].shift(1)
+                                         .rolling(window=window, min_periods=1)
+                                         .mean())
+    )
+    # Rolling std
+    df[f"roll_std_{window}h"] = (
+        df.groupby("AppName", group_keys=False)
+          .apply(lambda g: g["transactions"].shift(1)
+                                         .rolling(window=window, min_periods=1)
+                                         .std())
+    )
+    # EMA
+    df[f"ema_{window}h"] = (
+        df.groupby("AppName", group_keys=False)
+          .apply(lambda g: g["transactions"].shift(1)
+                                         .ewm(span=window, adjust=False)
+                                         .mean())
+    )
+
+# Daily-level features
+df["date"] = df["datetime"].dt.date
+daily = (
+    df.groupby(["AppName", "date"], as_index=False)["transactions"]
+      .sum()
+      .rename(columns={"transactions": "transactions_daily"})
+)
+
+# Daily lags and rolling
+for lag in [1, 7, 14]:
+    daily[f"lag_{lag}d"] = (
+        daily.groupby("AppName", group_keys=False)
+             .apply(lambda g: g["transactions_daily"].shift(lag))
+    )
+
+for window in [3, 7, 14]:
+    daily[f"roll_mean_{window}d"] = (
+        daily.groupby("AppName", group_keys=False)
+             .apply(lambda g: g["transactions_daily"].shift(1)
+                                                 .rolling(window=window, min_periods=1)
+                                                 .mean())
+    )
+    daily[f"ema_{window}d"] = (
+        daily.groupby("AppName", group_keys=False)
+             .apply(lambda g: g["transactions_daily"].shift(1)
+                                                 .ewm(span=window, adjust=False)
+                                                 .mean())
+    )
+
+# Merge daily features back to hourly
+df = df.merge(daily, on=["AppName", "date"], how="left")
+
+# Weekly-level features
+df["week"] = df["datetime"].dt.isocalendar().week
+df["year"] = df["datetime"].dt.year
+weekly = (
+    df.groupby(["AppName", "year", "week"], as_index=False)["transactions"]
+      .sum()
+      .rename(columns={"transactions": "transactions_weekly"})
+)
+
+# Weekly lags & rolling
+for lag in [1, 4, 8]:
+    weekly[f"lag_{lag}w"] = (
+        weekly.groupby("AppName", group_keys=False)
+              .apply(lambda g: g["transactions_weekly"].shift(lag))
+    )
+for window in [4, 8]:
+    weekly[f"roll_mean_{window}w"] = (
+        weekly.groupby("AppName", group_keys=False)
+              .apply(lambda g: g["transactions_weekly"].shift(1)
+                                                    .rolling(window=window, min_periods=1)
+                                                    .mean())
+    )
+
+# Merge weekly back
+df = df.merge(weekly, on=["AppName", "year", "week"], how="left")
+
+
+# Final All merged
+import pandas as pd
+import numpy as np
+from statsmodels.tsa.seasonal import seasonal_decompose
+
+def historical_fill(series, hist_mask):
+    """Fill NaNs using ffill/bfill + median, computed from historical portion only."""
+    hist_values = series[hist_mask]
+    median_val = hist_values.median()
+    filled = series.copy()
+    filled[hist_mask] = hist_values.ffill().bfill().fillna(median_val)
+    return filled
+
+def safe_seasonal_decompose(series, period):
+    """Compute STL-like seasonal decomposition on history only."""
+    if series.isna().all() or len(series) < period*2:
+        return pd.Series(np.nan, index=series.index), pd.Series(np.nan, index=series.index), pd.Series(np.nan, index=series.index)
+    filled = series.ffill().bfill()
+    decomp = seasonal_decompose(filled, model='additive', period=period, extrapolate_trend='freq')
+    return decomp.trend, decomp.seasonal, decomp.resid
+
+def create_features(df, last_known_date=None):
+    df = df.copy()
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    df = df.sort_values(['AppName', 'datetime'])
+
+    # Holiday merge
+    us_calendar = pd.read_csv('calendar.csv', parse_dates=['date'])
+    df = df.merge(us_calendar.rename(columns={'date':'datetime'})[['datetime','is_holiday']], on='datetime', how='left')
+
+    # Date parts
+    df['year'] = df['datetime'].dt.year
+    df['month'] = df['datetime'].dt.month
+    df['day_of_month'] = df['datetime'].dt.day
+    df['day_of_week'] = df['datetime'].dt.dayofweek
+    df['day_of_year'] = df['datetime'].dt.dayofyear
+    df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
+    df['is_holiday'] = df['is_holiday'].fillna(0).astype(int)
+    df['is_weekend_or_holiday'] = ((df['is_weekend']==1) | (df['is_holiday']==1)).astype(int)
+    df['is_weekday_afternoon_peak'] = ((df['day_of_week'] < 5) & (df['datetime'].dt.hour>=16) & (df['datetime'].dt.hour<18)).astype(int)
+
+    # Historical mask
+    hist_mask = df['datetime'] <= last_known_date if last_known_date is not None else pd.Series(True, index=df.index)
+
+    # Seasonal decomposition per app
+    trends, seasonals, residuals = [], [], []
+    for app, g in df.groupby('AppName', group_keys=False):
+        if last_known_date is not None:
+            gmask = g['datetime'] <= last_known_date
+            t, s, r = safe_seasonal_decompose(g.loc[gmask,'transactions'], period=24)
+            trend = pd.Series(np.nan, index=g.index); trend[gmask] = t
+            seas  = pd.Series(np.nan, index=g.index); seas[gmask]  = s
+            resid = pd.Series(np.nan, index=g.index); resid[gmask] = r
+        else:
+            trend, seas, resid = safe_seasonal_decompose(g['transactions'], period=24)
+        trends.append(trend.interpolate())
+        seasonals.append(seas.interpolate())
+        residuals.append(resid.interpolate())
+    df['trend'] = pd.concat(trends).sort_index()
+    df['seasonal'] = pd.concat(seasonals).sort_index()
+    df['residual'] = pd.concat(residuals).sort_index()
+
+    # ===== Hourly features =====
+    for lag in [1, 24, 168]:
+        df[f'lag_{lag}h'] = df.groupby('AppName', group_keys=False).apply(lambda g: g['transactions'].shift(lag))
+    for win in [3, 6, 24, 72, 168]:
+        df[f'roll_mean_{win}h'] = df.groupby('AppName', group_keys=False).apply(lambda g: g['transactions'].shift(1).rolling(win, min_periods=1).mean())
+        df[f'roll_std_{win}h']  = df.groupby('AppName', group_keys=False).apply(lambda g: g['transactions'].shift(1).rolling(win, min_periods=1).std())
+        df[f'ema_{win}h']       = df.groupby('AppName', group_keys=False).apply(lambda g: g['transactions'].shift(1).ewm(span=win, adjust=False).mean())
+
+    # ===== Daily aggregates =====
+    df['date'] = df['datetime'].dt.date
+    daily = df.groupby(['AppName','date'], as_index=False)['transactions'].sum().rename(columns={'transactions':'transactions_daily'})
+    for lag in [1, 7, 14]:
+        daily[f'lag_{lag}d'] = daily.groupby('AppName', group_keys=False).apply(lambda g: g['transactions_daily'].shift(lag))
+    for win in [3, 7, 14]:
+        daily[f'roll_mean_{win}d'] = daily.groupby('AppName', group_keys=False).apply(lambda g: g['transactions_daily'].shift(1).rolling(win,min_periods=1).mean())
+        daily[f'ema_{win}d']       = daily.groupby('AppName', group_keys=False).apply(lambda g: g['transactions_daily'].shift(1).ewm(span=win, adjust=False).mean())
+    df = df.merge(daily, on=['AppName','date'], how='left')
+
+    # ===== Weekly aggregates =====
+    df['week'] = df['datetime'].dt.isocalendar().week
+    df['year'] = df['datetime'].dt.year
+    weekly = df.groupby(['AppName','year','week'], as_index=False)['transactions'].sum().rename(columns={'transactions':'transactions_weekly'})
+    for lag in [1, 4, 8]:
+        weekly[f'lag_{lag}w'] = weekly.groupby('AppName', group_keys=False).apply(lambda g: g['transactions_weekly'].shift(lag))
+    for win in [4, 8]:
+        weekly[f'roll_mean_{win}w'] = weekly.groupby('AppName', group_keys=False).apply(lambda g: g['transactions_weekly'].shift(1).rolling(win,min_periods=1).mean())
+    df = df.merge(weekly, on=['AppName','year','week'], how='left')
+
+    # ===== Historical filling =====
+    for col in df.columns:
+        if any(col.startswith(prefix) for prefix in ('lag_', 'roll_', 'ema_')):
+            df[col] = historical_fill(df[col], hist_mask)
+
+    return df
+
