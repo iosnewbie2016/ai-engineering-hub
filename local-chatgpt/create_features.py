@@ -947,3 +947,18 @@ def create_features(df, last_known_date=None):
             df[col] = historical_fill(df[col], hist_mask)
 
     return df
+
+
+# Error
+# ===== Peak Lag =====
+for i in [1, 2, 3, 4]:
+    shifted = df.groupby("AppName")["transactions"].transform(lambda x: x.shift(i * 24))
+    df[f"lag_peak_{i}"] = shifted.where(df["is_weekday_afternoon_peak"] == 1)
+
+# ===== Peak Rolling Mean =====
+for win in [7, 14, 21]:  # win in days
+    masked = df["transactions"].where(df["is_weekday_afternoon_peak"] == 1)
+    df[f"rolling_mean_peak_{win}"] = (
+        masked.groupby(df["AppName"])
+              .transform(lambda x: x.shift(1).rolling(window=win * 24, min_periods=1).mean())
+    )
