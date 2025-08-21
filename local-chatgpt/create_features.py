@@ -962,3 +962,206 @@ for win in [7, 14, 21]:  # win in days
         masked.groupby(df["AppName"])
               .transform(lambda x: x.shift(1).rolling(window=win * 24, min_periods=1).mean())
     )
+
+# Fix for lag and rolling issues
+
+# Option 1- Recursive hour-by-hour inference utility
+# Uses a working copy of transactions to feed predictions back as pseudo-history.
+# Recomputes only the minimal feature row for each hour (fast and leakage-safe).
+# Assumes create_features is your final leakage-safe function with last_known_date parameter.
+
+import pandas as pd
+import numpy as np
+
+def predict_day_recursive(model, history_df, feature_fn, app_list, predict_date, model_features):
+    """
+    Recursive 24-step inference for one calendar date (00:00..23:00).
+    - model: trained LightGBM model
+    - history_df: full history up to last_known_ts (no placeholders), columns: ['datetime','AppName','transactions', ...]
+    - feature_fn: your create_features(df, last_known_date=...) function
+    - app_list: list/array of AppName to predict
+    - predict_date: 'YYYY-MM-DD' date (string or Timestamp) to forecast
+    - model_features: list of feature column names in the model
+
+    Returns: DataFrame with columns ['datetime','AppName','y_pred']
+    """
+    predict_date = pd.to_datetime(predict_date).date()
+    hours = pd.date_range(pd.Timestamp(predict_date), periods=24, freq="H")
+    last_known_ts = history_df['datetime'].max()
+
+    # Working "truth" that we augment with predictions as pseudo-history
+    work = history_df.copy()
+
+    preds = []
+
+    for ts in hours:
+        # Prepare 1-row inference df for this ts per app
+        inf_rows = pd.DataFrame({
+            'datetime': np.repeat(ts, len(app_list)),
+            'AppName': app_list,
+            'transactions': np.zeros(len(app_list))  # placeholder, never used directly by features due to shift(1)
+        })
+
+        # Append to work and build features with last_known_date fixed at historical max
+        sim_input = pd.concat([work, inf_rows], ignore_index=True)
+        feats_all = feature_fn(sim_input, last_known_date=last_known_ts)
+
+        # Extract just the current hour's rows (one per app)
+        feats_ts = feats_all[feats_all['datetime'] == ts].copy()
+
+        # IMPORTANT: For recursive mode, we DO allow lag_1h etc. to draw from previous predicted values.
+        # Because work contains prior predictions for earlier hours of this day.
+
+        X = feats_ts[model_features]
+        y_hat = model.predict(X)
+        out = feats_ts[['datetime','AppName']].copy()
+        out['y_pred'] = y_hat
+        preds.append(out)
+
+        # Write predictions back into work to be used as pseudo-history for next hour
+        new_obs = out.rename(columns={'y_pred':'transactions'})[['datetime','AppName','transactions']]
+        work = pd.concat([work, new_obs], ignore_index=True)
+
+    preds = pd.concat(preds, ignore_index=True)
+    return preds
+
+
+# option 2 - Single-shot wrapper: null-out intra-day-dependent features
+# Use one pass. For hours after 00:00 on the inference date, set features that require within-day history to NaN, so no illegal dependency on unknown values.
+# Keep lag_24h, lag_168h, long rollings, daily/weekly aggregates, holidays, seasonality, and cyclical time encodings.
+# Define which features depend on within-day history:
+# Example names below; adjust based on your feature set.
+
+def predict_day_single_shot(model, history_df, feature_fn, app_list, predict_date, model_features):
+    """
+    Non-recursive single-shot 24h forecast.
+    - Sets intra-day dependent features to NaN for hours > 00:00 on the forecast day.
+    """
+    predict_date = pd.to_datetime(predict_date).date()
+    hours = pd.date_range(pd.Timestamp(predict_date), periods=24, freq="H")
+    last_known_ts = history_df['datetime'].max()
+
+    # Build inference rows (placeholders) and compute all features once
+    infer_rows = pd.DataFrame(
+        {'datetime': np.repeat(hours, len(app_list)),
+         'AppName': np.tile(app_list, len(hours)),
+         'transactions': 0.0}
+    )
+    sim_input = pd.concat([history_df, infer_rows], ignore_index=True)
+    feats_all = feature_fn(sim_input, last_known_date=last_known_ts)
+
+    # Identify inference day rows
+    mask_day = feats_all['datetime'].dt.date == predict_date
+    feats_day = feats_all.loc[mask_day].copy()
+    feats_day['hour'] = feats_day['datetime'].dt.hour
+
+    # Define intra-day dependent features (examples; tailor to your names)
+    intraday_feats = [
+        'lag_1h', 'roll_mean_3h', 'roll_std_3h', 'ema_3h',
+        'roll_mean_6h', 'roll_std_6h', 'ema_6h',
+        'roll_mean_24h', 'roll_std_24h', 'ema_24h'
+        # add any others that require within-day past (i.e., need 06-19 00:00 for 01:00, etc.)
+    ]
+    intraday_cols = [c for c in intraday_feats if c in feats_day.columns]
+
+    # Null-out illegal intra-day features for hours > 0
+    feats_day.loc[feats_day['hour'] > 0, intraday_cols] = np.nan
+
+    # Predict with remaining valid features
+    X = feats_day[model_features]
+    y_hat = model.predict(X)
+
+    out = feats_day[['datetime','AppName']].copy()
+    out['y_pred'] = y_hat
+    return out.reset_index(drop=True)
+
+# Fix for residuals_by_dow
+# Issues:
+# residual_by_dow and residual_by_dow_smoothed were computed over the entire frame, so training may have used future info and inference distributions shift.
+# The fix: compute baselines from strictly historical data per AppName (and excluding holidays if desired), then map back; apply winsorization only on historical residuals; for inference rows, do not recompute group stats using them.
+# A robust approach:
+# Compute per-AppName day_of_week robust medians on history only (non-holiday if desired).
+# Map to both historical and inference rows by day_of_week (no use of future values).
+# Winsorize residuals per-AppName using only historical residuals.
+# Do not fill inference residuals using historical fill functions that recompute on entire DF; keep inference NaNs if they occur.
+
+def robust_median(series, mad_threshold=3.0):
+    m = series.median()
+    mad = (series - m).abs().median()
+    if mad == 0 or np.isnan(mad):
+        return m
+    lo = m - mad_threshold * mad
+    hi = m + mad_threshold * mad
+    return series.clip(lower=lo, upper=hi).median()
+
+def compute_residual_by_dow(df, last_known_date=None, exclude_holidays=True):
+    """
+    Leakage-safe residual_by_dow and residual_by_dow_smoothed per AppName.
+    - Baseline computed only from history (<= last_known_date if provided)
+    - Optionally exclude holidays from baseline estimation
+    - Winsorize residuals using historical portion only
+    Returns df with residual_by_dow and residual_by_dow_smoothed.
+    """
+    df = df.copy()
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    df = df.sort_values(['AppName','datetime'])
+
+    # Day-of-week
+    if 'day_of_week' not in df.columns:
+        df['day_of_week'] = df['datetime'].dt.dayofweek
+    if 'is_holiday' not in df.columns:
+        df['is_holiday'] = 0
+
+    if last_known_date is not None:
+        hist_mask = df['datetime'] <= last_known_date
+    else:
+        hist_mask = pd.Series(True, index=df.index)
+
+    # Build baselines per (AppName, DOW) from historical non-holiday rows if requested
+    baselines = []
+    for app, g in df.groupby('AppName'):
+        g_hist = g.loc[hist_mask.loc[g.index]]
+        if exclude_holidays:
+            g_hist = g_hist[g_hist['is_holiday'].astype(bool) == False]
+
+        if g_hist.empty:
+            # Fallback: global median if no history
+            baseline_map = {dow: g['transactions'].median() for dow in range(7)}
+        else:
+            baseline_map = {}
+            for dow, dsub in g_hist.groupby('day_of_week'):
+                if dsub.empty:
+                    baseline_map[dow] = g_hist['transactions'].median()
+                else:
+                    baseline_map[dow] = robust_median(dsub['transactions'])
+            # Fill any missing dows
+            all_dows = set(range(7))
+            missing = all_dows - set(baseline_map.keys())
+            if missing:
+                global_med = g_hist['transactions'].median()
+                for dow in missing:
+                    baseline_map[dow] = global_med
+
+        # Create a per-group Series aligned to g.index
+        base_series = g['day_of_week'].map(baseline_map)
+        base_series.index = g.index
+        baselines.append(base_series)
+
+    baseline_all = pd.concat(baselines).sort_index()
+    df['residual_by_dow'] = df['transactions'] - baseline_all
+
+    # Winsorize residuals per AppName using history only
+    smoothed = []
+    for app, g in df.groupby('AppName'):
+        g_hist_res = g.loc[hist_mask.loc[g.index], 'residual_by_dow']
+        if g_hist_res.empty:
+            # No history: leave as-is
+            smoothed.append(pd.Series(g['residual_by_dow'].values, index=g.index))
+            continue
+        lo = g_hist_res.quantile(0.05)
+        hi = g_hist_res.quantile(0.95)
+        clipped = g['residual_by_dow'].clip(lower=lo, upper=hi)
+        smoothed.append(clipped)
+
+    df['residual_by_dow_smoothed'] = pd.concat(smoothed).sort_index()
+    return df
