@@ -1165,3 +1165,46 @@ def compute_residual_by_dow(df, last_known_date=None, exclude_holidays=True):
 
     df['residual_by_dow_smoothed'] = pd.concat(smoothed).sort_index()
     return df
+
+from statsmodels.tsa.seasonal import seasonal_decompose
+
+def decompose_trailing(series, period=24, window=56*24):
+    """
+    Returns trend, seasonal, resid where each value for t is computed from a trailing window: [t-window, t-1]
+    """
+    N = len(series)
+    trend = np.full(N, np.nan)
+    seasonal = np.full(N, np.nan)
+    resid = np.full(N, np.nan)
+
+    series_filled = series.ffill().bfill()
+
+    for i in range(window, N):
+        win_slice = series_filled[i-window:i]  # strictly past data
+        # Decompose only if enough non-NaN
+        if win_slice.isnull().mean() < 0.2 and win_slice.count() > period*2:
+            dec = seasonal_decompose(win_slice, model='additive', period=period, extrapolate_trend='freq')
+            # Assign latest value (for time i)
+            trend[i] = dec.trend.iloc[-1]
+            seasonal[i] = dec.seasonal.iloc[-1]
+            resid[i] = dec.resid.iloc[-1]
+        # if insufficient history, keep output as NaN
+    return pd.Series(trend, index=series.index), pd.Series(seasonal, index=series.index), pd.Series(resid, index=series.index)
+
+
+for app, g in df.groupby('AppName'):
+    t, s, r = decompose_trailing(g['transactions'], period=24, window=56*24)
+    df.loc[g.index, 'trend'] = t
+    df.loc[g.index, 'seasonal'] = s
+    df.loc[g.index, 'residual'] = r
+
+def group_trailing_mean(df, key_cols, value_col, trailing_hours):
+    means = []
+    for app, g in df.groupby('AppName'):
+        # Only historical portion if needed (prior to last_known_date for inference)
+        g = g.sort_values('datetime')
+        rolling_means = g.set_index('datetime').groupby(key_cols)[value_col].rolling(window=trailing_hours, min_periods=1).mean().reset_index()
+        # Merge back on key_cols + datetime for safe alignment
+        means.append(rolling_means)
+    # Concatenate all groups and merge with df as needed
+    return pd.concat(means, ignore_index=True)
