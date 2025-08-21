@@ -1208,3 +1208,47 @@ def group_trailing_mean(df, key_cols, value_col, trailing_hours):
         means.append(rolling_means)
     # Concatenate all groups and merge with df as needed
     return pd.concat(means, ignore_index=True)
+
+
+
+def safe_daily_aggregate(df, last_known_date):
+    """
+    Compute leakage-safe daily transaction aggregates.
+
+    Parameters:
+     - df: DataFrame with columns ['datetime', 'AppName', 'transactions'] and inference placeholders with zero transactions
+     - last_known_date: Timestamp up to which data is real (e.g., 2025-06-18 23:00:00)
+
+    Returns:
+     - df with a new column 'transactions_daily' with NaN for inference day, real daily sums for history
+    """
+
+    # Extract date for grouping
+    df['date'] = df['datetime'].dt.date
+
+    # Split into history and inference placeholder parts
+    hist_df = df[df['datetime'] <= last_known_date]
+    infer_dates = df[df['datetime'] > last_known_date]['date'].unique()
+
+    # Compute daily sum only on history
+    daily_hist = (
+        hist_df.groupby(['AppName', 'date'], as_index=False)['transactions']
+        .sum()
+        .rename(columns={'transactions': 'transactions_daily'})
+    )
+
+    # Build null daily rows for inference dates
+    apps = hist_df['AppName'].unique()
+    null_daily = pd.DataFrame({
+        'AppName': np.repeat(apps, len(infer_dates)),
+        'date': np.tile(infer_dates, len(apps)),
+        'transactions_daily': np.nan
+    })
+
+    # Combine history + null inference daily sums
+    daily_all = pd.concat([daily_hist, null_daily], ignore_index=True)
+
+    # Merge back to original df
+    df = df.merge(daily_all, on=['AppName', 'date'], how='left')
+
+    return df
