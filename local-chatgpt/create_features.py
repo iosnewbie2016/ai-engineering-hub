@@ -1472,3 +1472,171 @@ for col in df.columns:
         if not s.index.equals(df.index):
             s = s.reindex(df.index)
         df[col] = historical_fill(s, hist_mask)   
+
+
+
+# Fix for duplicate rows
+def safe_daily_features(df, last_known_date=None):
+    """
+    Leakage-safe daily aggregates and daily lag/rolling/EMA with dedup protection.
+    - df must contain: ['datetime','AppName','transactions'] (and may include future placeholders).
+    - last_known_date: None for training/validation; timestamp for inference (last observed hour).
+    Returns: df with daily features merged and no duplicate (AppName, datetime) rows introduced.
+    """
+    df = df.copy()
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    df['date'] = df['datetime'].dt.date
+    df['AppName'] = df['AppName'].astype(str)
+    # Split history vs future
+    if last_known_date is not None:
+        hist_mask = df['datetime'] <= last_known_date
+        hist_df = df.loc[hist_mask, ['AppName','date','transactions']]
+        future_dates = df.loc[~hist_mask, 'date'].unique()
+    else:
+        hist_df = df[['AppName','date','transactions']]
+        future_dates = []
+
+    # Compute daily sum on history only
+    daily_hist = (
+        hist_df.groupby(['AppName','date'], as_index=False)['transactions']
+            .sum()
+            .rename(columns={'transactions':'transactions_daily'})
+    )
+    daily_hist['AppName'] = daily_hist['AppName'].astype(str)
+    daily_hist['date'] = pd.to_datetime(daily_hist['date']).dt.date
+
+    # Create NaN placeholders for future dates (no overlap with history)
+    if len(future_dates) > 0:
+        apps = daily_hist['AppName'].unique()
+        if len(apps) == 0:
+            apps = df['AppName'].unique()
+        daily_null = pd.DataFrame({
+            'AppName': np.repeat(apps, len(future_dates)),
+            'date': np.tile(future_dates, len(apps)),
+            'transactions_daily': np.nan
+        })
+        daily_null['AppName'] = daily_null['AppName'].astype(str)
+        daily_null['date'] = pd.to_datetime(daily_null['date']).dt.date
+        daily_all = pd.concat([daily_hist, daily_null], ignore_index=True)
+    else:
+        daily_all = daily_hist
+
+    # Normalize types, sort, drop duplicates on keys
+    daily_all['AppName'] = daily_all['AppName'].astype(str)
+    daily_all['date'] = pd.to_datetime(daily_all['date']).dt.date
+    daily_all = daily_all.sort_values(['AppName','date']).drop_duplicates(
+        subset=['AppName','date'], keep='first'
+    ).reset_index(drop=True)
+
+    # Build daily lags/roll/ema on the daily frame itself
+    # Important: operate on per-AppName sorted series for stable, leak-free behavior
+    def _build_daily_stats(d):
+        d = d.sort_values('date').copy()
+        for lag in :
+            d[f'lag_{lag}d'] = d['transactions_daily'].shift(lag)
+        for window in :
+            d[f'roll_mean_{window}d'] = d['transactions_daily'].shift(1).rolling(window, min_periods=1).mean()
+            d[f'roll_std_{window}d']  = d['transactions_daily'].shift(1).rolling(window, min_periods=1).std()
+            d[f'ema_{window}d']       = d['transactions_daily'].shift(1).ewm(span=window, adjust=False).mean()
+        return d
+
+    daily_all = (
+        daily_all.groupby('AppName', group_keys=False)
+                .apply(_build_daily_stats)
+                .reset_index(drop=True)
+    )
+
+    # Merge back to hourly, ensuring keys are aligned and no row explosion
+    df = df.merge(
+        daily_all,
+        on=['AppName','date'],
+        how='left',
+        validate='many_to_one'  # ensures one daily row per (AppName,date)
+    )
+
+    # Guarantee no duplicates on (AppName, datetime)
+    df = df.drop_duplicates(subset=['AppName','datetime']).reset_index(drop=True)
+    return df
+
+
+def safe_weekly_features(df, last_known_date=None):
+    """
+    Leakage-safe weekly aggregates and weekly lag/rolling/EMA with dedup protection.
+    - df must contain: ['datetime','AppName','transactions'] (and may include future placeholders).
+    - last_known_date: None for training; timestamp for inference (last observed hour).
+    Returns: df with weekly features merged and no duplicate (AppName, datetime) rows introduced.
+    """
+    df = df.copy()
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    df['AppName'] = df['AppName'].astype(str)
+    iso = df['datetime'].dt.isocalendar()
+    df['iso_year'] = iso.year.astype(int)
+    df['iso_week'] = iso.week.astype(int)
+    # Split history vs future
+    if last_known_date is not None:
+        hist_mask = df['datetime'] <= last_known_date
+        hist_week = df.loc[hist_mask, ['AppName','iso_year','iso_week','transactions']]
+        future_week_keys = (
+            df.loc[~hist_mask, ['AppName','iso_year','iso_week']]
+            .drop_duplicates()
+        )
+    else:
+        hist_week = df[['AppName','iso_year','iso_week','transactions']]
+        future_week_keys = pd.DataFrame(columns=['AppName','iso_year','iso_week'])
+
+    # Compute weekly sum on history only
+    weekly_hist = (
+        hist_week.groupby(['AppName','iso_year','iso_week'], as_index=False)['transactions']
+                .sum()
+                .rename(columns={'transactions':'transactions_weekly'})
+    )
+    weekly_hist['AppName'] = weekly_hist['AppName'].astype(str)
+    weekly_hist['iso_year'] = weekly_hist['iso_year'].astype(int)
+    weekly_hist['iso_week'] = weekly_hist['iso_week'].astype(int)
+
+    # Create NaN placeholders for future weeks (no overlap with history)
+    if not future_week_keys.empty:
+        wk_null = future_week_keys.copy()
+        wk_null['AppName'] = wk_null['AppName'].astype(str)
+        wk_null['iso_year'] = wk_null['iso_year'].astype(int)
+        wk_null['iso_week'] = wk_null['iso_week'].astype(int)
+        wk_null['transactions_weekly'] = np.nan
+        weekly_all = pd.concat([weekly_hist, wk_null], ignore_index=True)
+    else:
+        weekly_all = weekly_hist
+
+    # Normalize types, sort, drop duplicates on keys
+    weekly_all['AppName'] = weekly_all['AppName'].astype(str)
+    weekly_all['iso_year'] = weekly_all['iso_year'].astype(int)
+    weekly_all['iso_week'] = weekly_all['iso_week'].astype(int)
+    weekly_all = weekly_all.sort_values(['AppName','iso_year','iso_week']).drop_duplicates(
+        subset=['AppName','iso_year','iso_week'], keep='first'
+    ).reset_index(drop=True)
+
+    # Build weekly lags/roll/ema on the weekly frame itself
+    def _build_weekly_stats(w):
+        w = w.sort_values(['iso_year','iso_week']).copy()
+        for lag in :
+            w[f'lag_{lag}w'] = w['transactions_weekly'].shift(lag)
+        for window in :
+            w[f'roll_mean_{window}w'] = w['transactions_weekly'].shift(1).rolling(window, min_periods=1).mean()
+            w[f'ema_{window}w']       = w['transactions_weekly'].shift(1).ewm(span=window, adjust=False).mean()
+        return w
+
+    weekly_all = (
+        weekly_all.groupby('AppName', group_keys=False)
+                .apply(_build_weekly_stats)
+                .reset_index(drop=True)
+    )
+
+    # Merge back with strict key validation to avoid row explosion
+    df = df.merge(
+        weekly_all,
+        on=['AppName','iso_year','iso_week'],
+        how='left',
+        validate='many_to_one'  # one weekly row per (AppName, year, week)
+    )
+
+    # Guarantee no duplicates on (AppName, datetime)
+    df = df.drop_duplicates(subset=['AppName','datetime']).reset_index(drop=True)
+    return df
