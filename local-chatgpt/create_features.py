@@ -1333,3 +1333,92 @@ df_train = safe_daily_features(df_train, last_known_date=None)
 # For inference (pass last known actual timestamp)
 last_known_date = pd.Timestamp("2025-06-18 23:00:00")
 df_infer = safe_daily_features(df_infer, last_known_date=last_known_date)
+
+
+# Changes to weekly logic
+import pandas as pd
+import numpy as np
+
+def safe_weekly_features(df, last_known_date=None):
+    """
+    Compute leakage-safe weekly aggregates and weekly lag/rolling/EMA features.
+
+    Inputs:
+      df: DataFrame with at least ['datetime','AppName','transactions'].
+          Can include inference placeholder rows (e.g., future dates with 0 transactions).
+      last_known_date: Timestamp or None.
+        - None for training/validation: compute weekly stats on all provided rows.
+        - Timestamp for inference: compute weekly stats only from rows with datetime <= last_known_date.
+    
+    Returns:
+      df with new weekly features merged:
+        - transactions_weekly
+        - lag_1w, lag_2w, lag_4w (weekly lags)
+        - roll_mean_4w, roll_mean_8w (weekly rolling means)
+        - ema_4w, ema_8w (weekly EMAs)
+    """
+    df = df.copy()
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    # ISO week/year for stable weekly grouping
+    iso = df['datetime'].dt.isocalendar()
+    df['iso_year'] = iso.year.astype(int)
+    df['iso_week'] = iso.week.astype(int)
+
+    # Split history vs inference by timestamp
+    if last_known_date is not None:
+        hist_mask = df['datetime'] <= last_known_date
+        hist_df = df.loc[hist_mask]
+        # Identify any (year, week) combinations that exist after last_known_date (inference weeks)
+        infer_weeks = (
+            df.loc[~hist_mask, ['AppName','iso_year','iso_week']]
+              .drop_duplicates()
+              .to_numpy()
+        )
+    else:
+        hist_df = df
+        infer_weeks = np.empty((0,3), dtype=object)
+
+    # Weekly aggregate on history only
+    weekly = (
+        hist_df.groupby(['AppName','iso_year','iso_week'], as_index=False)['transactions']
+               .sum()
+               .rename(columns={'transactions':'transactions_weekly'})
+    )
+
+    # Create NaN placeholders for inference weeks so they merge but don’t use placeholders
+    if infer_weeks.size > 0:
+        apps = hist_df['AppName'].unique()
+        wk_rows = []
+        # If not all apps are in infer weeks entries, we still want NaN rows for all apps present in history
+        for app in apps:
+            mask_app = infer_weeks[:,0] == app
+            # If no explicit rows for this app were found after cutoff, skip
+            # (merge will simply not produce weekly rows for those weeks)
+            for _, y, w in infer_weeks[mask_app]:
+                wk_rows.append((app, int(y), int(w), np.nan))
+        if wk_rows:
+            null_weekly = pd.DataFrame(wk_rows, columns=['AppName','iso_year','iso_week','transactions_weekly'])
+            weekly = pd.concat([weekly, null_weekly], ignore_index=True)
+
+    # Weekly lags
+    for lag in [1, 2, 4]:
+        weekly[f'lag_{lag}w'] = (
+            weekly.groupby('AppName')['transactions_weekly']
+                  .transform(lambda x: x.shift(lag))
+        )
+
+    # Weekly rolling means (trailing, past-only with shift(1))
+    for win in [4, 8]:
+        weekly[f'roll_mean_{win}w'] = (
+            weekly.groupby('AppName')['transactions_weekly']
+                  .transform(lambda x: x.shift(1).rolling(window=win, min_periods=1).mean())
+        )
+        weekly[f'ema_{win}w'] = (
+            weekly.groupby('AppName')['transactions_weekly']
+                  .transform(lambda x: x.shift(1).ewm(span=win, adjust=False).mean())
+        )
+
+    # Merge weekly features back to hourly frame
+    df = df.merge(weekly, on=['AppName','iso_year','iso_week'], how='left')
+
+    return df
