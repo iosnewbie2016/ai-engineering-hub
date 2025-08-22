@@ -1252,3 +1252,84 @@ def safe_daily_aggregate(df, last_known_date):
     df = df.merge(daily_all, on=['AppName', 'date'], how='left')
 
     return df
+
+
+# 
+def safe_daily_features(df, last_known_date):
+    """
+    Compute daily transaction aggregates + daily lag/rolling features leakage-safe.
+
+    Parameters:
+     - df: DataFrame with ['datetime','AppName','transactions'].
+     - last_known_date: Timestamp or None. Cut-off for historical data to avoid leakage in inference.
+
+    Returns:
+     - df with daily features merged:
+       transactions_daily, daily lags, rolling means/stds, EMAs
+    """
+
+    df = df.copy()
+    df['date'] = df['datetime'].dt.date
+
+    # Split history & inference placeholder days
+    if last_known_date is not None:
+        hist_df = df[df['datetime'] <= last_known_date]
+        infer_dates = df[df['datetime'] > last_known_date]['date'].unique()
+    else:
+        hist_df = df
+        infer_dates = []
+
+    # Compute daily sum on history only
+    daily = (
+        hist_df.groupby(['AppName','date'], as_index=False)['transactions']
+        .sum()
+        .rename(columns={'transactions':'transactions_daily'})
+    )
+
+    # Create null daily sums for inference days
+    if len(infer_dates) > 0:
+        apps = hist_df['AppName'].unique()
+        null_daily = pd.DataFrame({
+            'AppName': np.repeat(apps, len(infer_dates)),
+            'date': np.tile(infer_dates, len(apps)),
+            'transactions_daily': np.nan
+        })
+        daily = pd.concat([daily, null_daily], ignore_index=True)
+
+    # Compute daily lags on historical + null entries -- use transform to align by index
+    for lag in [1,7,14]:
+        daily[f'lag_{lag}d'] = (
+            daily.groupby('AppName')['transactions_daily']
+            .transform(lambda x: x.shift(lag))
+        )
+
+    # Daily rolling mean and std
+    for window in [3,7,14]:
+        daily[f'roll_mean_{window}d'] = (
+            daily.groupby('AppName')['transactions_daily']
+            .transform(lambda x: x.shift(1).rolling(window=window,min_periods=1).mean())
+        )
+        daily[f'roll_std_{window}d'] = (
+            daily.groupby('AppName')['transactions_daily']
+            .transform(lambda x: x.shift(1).rolling(window=window,min_periods=1).std())
+        )
+
+    # Daily EMA
+    for window in [3,7,14]:
+        daily[f'ema_{window}d'] = (
+            daily.groupby('AppName')['transactions_daily']
+            .transform(lambda x: x.shift(1).ewm(span=window, adjust=False).mean())
+        )
+
+    # Merge daily features back to original df
+    df = df.merge(daily, on=['AppName','date'], how='left')
+
+    return df
+
+# Usage
+# For training/validation (no last_known_date needed)
+df_train = safe_daily_features(df_train, last_known_date=None)
+
+# For inference (pass last known actual timestamp)
+last_known_date = pd.Timestamp("2025-06-18 23:00:00")
+df_infer = safe_daily_features(df_infer, last_known_date=last_known_date)
