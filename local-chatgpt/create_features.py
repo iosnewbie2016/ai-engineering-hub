@@ -1422,3 +1422,53 @@ def safe_weekly_features(df, last_known_date=None):
     df = df.merge(weekly, on=['AppName','iso_year','iso_week'], how='left')
 
     return df
+
+# historical_fill
+if not isinstance(series, pd.Series):
+    series = pd.Series(series)
+# Align mask to the series index
+if isinstance(hist_mask, pd.Series):
+    hist_mask_aligned = hist_mask.reindex(series.index, fill_value=False)
+else:
+    # If mask is a scalar/bool or None
+    hist_mask_aligned = pd.Series(bool(hist_mask), index=series.index)
+
+hist_values = series[hist_mask_aligned]
+median_val = hist_values.median()
+
+filled = series.copy()
+# Fill only historical rows; leave future rows untouched (NaN ok for model)
+filled.loc[hist_mask_aligned] = (
+    hist_values.ffill().bfill().fillna(median_val)
+)
+return filled
+
+
+# CHANGED: Build a hist_mask always aligned to df index
+if last_known_date is not None:
+    hist_mask = (df[date_col] <= last_known_date)
+else:
+    hist_mask = pd.Series(True, index=df.index)
+
+# ===========================================
+# CHANGED: Historical filling with reindexing
+# ===========================================
+# Optional: ensure df index is clean before fill
+df = df.reset_index(drop=True)
+# Re-assert hist_mask aligned to df after merges
+if isinstance(hist_mask, pd.Series):
+    hist_mask = hist_mask.reindex(df.index, fill_value=False)
+else:
+    hist_mask = pd.Series(bool(hist_mask), index=df.index)
+
+# Sanity check alignment
+assert hist_mask.index.equals(df.index), "hist_mask not aligned post-merge"
+
+# Fill only lag_/roll_/ema_ (skip _peak if you want)
+for col in df.columns:
+    if col.startswith(('lag_', 'roll_', 'ema_')) and not col.endswith('_peak'):
+        s = df[col]
+        # Reindex series to df to guarantee same index
+        if not s.index.equals(df.index):
+            s = s.reindex(df.index)
+        df[col] = historical_fill(s, hist_mask)   
