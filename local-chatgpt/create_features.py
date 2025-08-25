@@ -1969,3 +1969,118 @@ ema_days=(3, 7, 14)
     df = df.drop_duplicates(subset=['AppName', 'datetime']).reset_index(drop=True)[9]
     
     return df
+
+
+
+def safe_daily_features(
+df,
+last_known_date=None,
+lag_days=(1, 7, 14),
+roll_days=(3, 7, 14),
+ema_days=(3, 7, 14)
+):
+    """
+    Build leakage-safe daily features and merge back to hourly rows.
+    
+    text
+    Training/validation (last_known_date=None):
+      - Compute transactions_daily for all days.
+      - Compute daily lags/rolling mean/std/EMA per AppName on the daily series.
+      - Merge back to hourly (many hourly -> one daily row).
+    
+    Inference (last_known_date provided, e.g., 2025-06-18 23:00:00):
+      - Compute daily features using history only (<= last_known_date).
+      - Merge back; prediction-date rows get transactions_daily = NaN (unknown).
+      - Carry trailing daily derived features (lag/roll/EMA) from the last fully observed day
+        into prediction-date rows so these are NOT NaN. This avoids leakage while preserving signal.
+    
+    Requires df with ['datetime','AppName','transactions'].
+    """
+    df = df.copy()
+    
+    # Normalize keys
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    df['date'] = df['datetime'].dt.date
+    
+    # Partition history vs future
+    if last_known_date is not None:
+        last_known_date = pd.to_datetime(last_known_date)
+        hist_mask = df['datetime'] <= last_known_date
+        df_hist = df.loc[hist_mask, ['AppName', 'date', 'transactions']].copy()
+        pred_dates = df.loc[~hist_mask, 'date'].unique()
+    else:
+        df_hist = df[['AppName', 'date', 'transactions']].copy()
+        pred_dates = []
+    
+    # Ensure pure date dtype
+    df_hist['date'] = pd.to_datetime(df_hist['date']).dt.date
+    
+    # 1) Daily totals on history only
+    daily = (
+        df_hist.groupby(['AppName', 'date'], as_index=False)['transactions']
+               .sum()
+               .rename(columns={'transactions': 'transactions_daily'})
+    )
+    
+    # 2) Derived daily features per AppName, sorted by date
+    def _build_daily_stats(g):
+        g = g.sort_values('date').copy()
+        for d in lag_days:
+            g[f'lag_{d}d'] = g['transactions_daily'].shift(d)
+        for d in roll_days:
+            g[f'roll_mean_{d}d'] = g['transactions_daily'].shift(1).rolling(window=d, min_periods=1).mean()
+            g[f'roll_std_{d}d']  = g['transactions_daily'].shift(1).rolling(window=d, min_periods=1).std()
+        for d in ema_days:
+            g[f'ema_{d}d'] = g['transactions_daily'].shift(1).ewm(span=d, adjust=False).mean()
+        return g
+    
+    daily = (
+        daily.groupby('AppName', group_keys=False)
+             .apply(_build_daily_stats)
+             .reset_index(drop=True)
+    )
+    
+    # 3) Merge daily features back to hourly (right side unique per key)
+    df = df.merge(
+        daily,
+        on=['AppName', 'date'],
+        how='left',
+        validate='many_to_one'
+    )
+    
+    # 4) Inference-only: carry trailing derived daily features into prediction-day rows
+    if (last_known_date is not None) and (len(pred_dates) > 0):
+        last_day = last_known_date.date()
+        last_rows = daily[daily['date'] == last_day].copy()
+        if last_rows.shape == 0:
+            # Fallback: pick the most recent available day per AppName
+            idx = daily.groupby('AppName')['date'].idxmax()
+            last_rows = daily.loc[idx].copy()
+    
+        # Only derived features; do NOT include transactions_daily
+        derived_cols = [c for c in daily.columns if c not in ('AppName', 'date', 'transactions_daily')]
+        carry = last_rows[['AppName'] + derived_cols].copy()
+    
+        if carry.shape > 0:
+            # Strictly after last_known_date are prediction rows
+            pred_mask = df['datetime'] > last_known_date
+    
+            # Merge carry by AppName; creates *_carry companions where applicable
+            df = df.merge(carry, on='AppName', how='left', suffixes=('', '_carry'))
+    
+            # Fill prediction rows’ NaNs in derived daily features from *_carry
+            for c in derived_cols:
+                carry_col = f'{c}_carry'
+                if (c in df.columns) and (carry_col in df.columns):
+                    df.loc[pred_mask, c] = df.loc[pred_mask, c].fillna(df.loc[pred_mask, carry_col])
+    
+            # Drop temporary *_carry columns
+            drop_cols = [f'{c}_carry' for c in derived_cols if f'{c}_carry' in df.columns]
+            if len(drop_cols) > 0:
+                df.drop(columns=drop_cols, inplace=True)
+    
+        # Important: transactions_daily remains NaN on prediction dates (unknown day total)
+    
+    # 5) Uniqueness guard
+    df = df.drop_duplicates(subset=['AppName', 'datetime']).reset_index(drop=True)
+    return df
