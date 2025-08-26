@@ -2084,3 +2084,159 @@ ema_days=(3, 7, 14)
     # 5) Uniqueness guard
     df = df.drop_duplicates(subset=['AppName', 'datetime']).reset_index(drop=True)
     return df
+
+
+# Updated residuals_by_dow as that closely follows current transaction values
+def robust_median(series, mad_threshold=3.0):
+    m = series.median()
+    mad = (series - m).abs().median()
+    if pd.isna(mad) or mad == 0:
+    return m
+    lo = m - mad_threshold * mad
+    hi = m + mad_threshold * mad
+    return series.clip(lower=lo, upper=hi).median()
+
+def compute_residual_by_dow(df, last_known_date=None, exclude_holidays=True):
+    """
+    Leakage-safe residual_by_dow and residual_by_dow_smoothed per AppName with DOW×hour and holiday conditioning.
+    Behavior:
+    - Historical rows (<= last_known_date, or all rows if None):
+    residual_by_dow = transactions - baseline_dow (baseline from non-holiday history if exclude_holidays=True)
+    residual_by_dow_smoothed = residual_by_dow clipped to [p5, p95] computed from historical residuals
+    - Prediction rows (> last_known_date):
+    residual_by_dow = expected residual from historical distribution conditioned on (dow, hour, holiday)
+    residual_by_dow_smoothed = that expected residual winsorized to historical [p5, p95]
+    This preserves the same column names without reading current transactions on prediction rows.
+    """
+    df = df.copy()
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    df = df.sort_values(['AppName','datetime']).reset_index(drop=True)
+    
+    # Ensure helper columns exist
+    if 'day_of_week' not in df.columns:
+        df['day_of_week'] = df['datetime'].dt.dayofweek
+    if 'hour_of_day' not in df.columns:
+        df['hour_of_day'] = df['datetime'].dt.hour
+    if 'is_holiday' not in df.columns:
+        df['is_holiday'] = 0
+    
+    # Masks
+    if last_known_date is not None:
+        last_known_date = pd.to_datetime(last_known_date)
+        hist_mask_global = df['datetime'] <= last_known_date
+        pred_mask_global = df['datetime'] > last_known_date
+    else:
+        hist_mask_global = pd.Series(True, index=df.index)
+        pred_mask_global = pd.Series(False, index=df.index)
+    
+    # Initialize outputs
+    df['residual_by_dow'] = np.nan
+    df['residual_by_dow_smoothed'] = np.nan
+    
+    # Process per AppName
+    for app, g in df.groupby('AppName', group_keys=False):
+        idx = g.index
+        hist_mask = hist_mask_global.loc[idx]
+        pred_mask = pred_mask_global.loc[idx]
+    
+        g_hist = g.loc[hist_mask]
+        # Baseline (median) per DOW built from historical rows, optionally excluding holidays
+        if exclude_holidays:
+            g_hist_for_base = g_hist[g_hist['is_holiday'].astype(bool) == False]
+        else:
+            g_hist_for_base = g_hist
+    
+        # Build baseline_dow map using robust median of transactions per day_of_week
+        base_map = {}
+        if g_hist_for_base.empty:
+            # Fallback: overall historical median (or 0 if no history)
+            fallback = g_hist['transactions'].median() if len(g_hist) else 0.0
+            for dow in range(7):
+                base_map[dow] = fallback
+        else:
+            global_med = g_hist_for_base['transactions'].median()
+            for dow in range(7):
+                dsub = g_hist_for_base.loc[g_hist_for_base['day_of_week'] == dow, 'transactions']
+                base_map[dow] = robust_median(dsub) if len(dsub) else global_med
+    
+        # Map baseline to all rows
+        baseline_series = g['day_of_week'].map(base_map)
+        baseline_series.index = idx
+    
+        # Historical residuals (no leakage)
+        resid_hist = g.loc[hist_mask, 'transactions'] - baseline_series.loc[hist_mask]
+        df.loc[idx[hist_mask], 'residual_by_dow'] = resid_hist.values
+    
+        # Winsorization limits from historical portion only
+        if resid_hist.notna().any():
+            lo = resid_hist.quantile(0.05)
+            hi = resid_hist.quantile(0.95)
+        else:
+            lo, hi = -np.inf, np.inf
+    
+        # Smoothed residuals for history
+        df.loc[idx[hist_mask], 'residual_by_dow_smoothed'] = np.clip(resid_hist.values, lo, hi)
+    
+        # Prediction rows: do NOT use current transactions
+        # Build expected residual conditioned on (day_of_week, hour_of_day, is_holiday) from historical data.
+        # Step 1: compute historical residuals (transactions - baseline_dow) on historical rows only
+        if len(g_hist) > 0:
+            hist_resid_full = g_hist['transactions'] - g_hist['day_of_week'].map(base_map).values
+            # Group keys for conditioning
+            grp_keys = ['day_of_week', 'hour_of_day', 'is_holiday']
+            # Aggregate robust median residual per (dow, hour, holiday)
+            # If some combos missing, fall back to broader groups progressively
+            # First, map exact combo medians
+            med_by_combo = (
+                pd.DataFrame({
+                    'day_of_week': g_hist['day_of_week'].values,
+                    'hour_of_day': g_hist['hour_of_day'].values,
+                    'is_holiday': g_hist['is_holiday'].values,
+                    'resid': hist_resid_full.values
+                })
+                .groupby(grp_keys)['resid'].apply(robust_median).to_dict()
+            )
+            # Also build per (dow, hour) medians (holiday-agnostic) fallback
+            med_by_dow_hour = (
+                pd.DataFrame({
+                    'day_of_week': g_hist['day_of_week'].values,
+                    'hour_of_day': g_hist['hour_of_day'].values,
+                    'resid': hist_resid_full.values
+                })
+                .groupby(['day_of_week','hour_of_day'])['resid'].apply(robust_median).to_dict()
+            )
+            # And per DOW only fallback
+            med_by_dow = (
+                pd.DataFrame({
+                    'day_of_week': g_hist['day_of_week'].values,
+                    'resid': hist_resid_full.values
+                })
+                .groupby(['day_of_week'])['resid'].apply(robust_median).to_dict()
+            )
+            # Global fallback
+            global_resid_med = robust_median(hist_resid_full)
+        else:
+            med_by_combo, med_by_dow_hour, med_by_dow = {}, {}, {}
+            global_resid_med = 0.0
+    
+        # Function to get expected residual for a row using fallbacks
+        def expected_resid(row):
+            key = (row['day_of_week'], row['hour_of_day'], int(row['is_holiday']))
+            if key in med_by_combo:
+                return med_by_combo[key]
+            key2 = (row['day_of_week'], row['hour_of_day'])
+            if key2 in med_by_dow_hour:
+                return med_by_dow_hour[key2]
+            if row['day_of_week'] in med_by_dow:
+                return med_by_dow[row['day_of_week']]
+            return global_resid_med
+    
+        # Assign expected residuals to prediction rows only (keep same column names)
+        if pred_mask.any():
+            exp_vals = g.loc[pred_mask, ['day_of_week','hour_of_day','is_holiday']].apply(expected_resid, axis=1)
+            exp_vals = exp_vals.astype(float).values if len(exp_vals) else np.array([])
+            # Write into the same columns for prediction rows
+            df.loc[idx[pred_mask], 'residual_by_dow'] = exp_vals
+            df.loc[idx[pred_mask], 'residual_by_dow_smoothed'] = np.clip(exp_vals, lo, hi) if len(exp_vals) else np.array([])
+    
+    return df
