@@ -2240,3 +2240,109 @@ def compute_residual_by_dow(df, last_known_date=None, exclude_holidays=True):
             df.loc[idx[pred_mask], 'residual_by_dow_smoothed'] = np.clip(exp_vals, lo, hi) if len(exp_vals) else np.array([])
     
     return df
+
+
+
+# How to analyse low inference value
+# 1. End-to-End Parity of Features on Prediction Rows
+# Goal: Ensure all feature columns for the inference date (e.g., 2025-06-19) are identical between the training/validation pipeline (last_known_date=None) and your inference pipeline (last_known_date=timestamp, with placeholders).
+# This guarantees training and inference semantics truly match.
+
+import numpy as np
+
+# Simulate pipeline calls
+feats_train = create_features(history_plus_future_rows, last_known_date=None)
+feats_infer = create_features(history_plus_placeholder_rows, last_known_date=your_last_ts)
+
+mask_pred = feats_infer['datetime'].dt.date == pd.to_datetime('2025-06-19').date()
+common_cols = [c for c in feats_train.columns if c in feats_infer.columns and c not in ['transactions', 'target']]  # exclude target/y
+
+parity = []
+A = feats_train[mask_pred][common_cols].sort_values(['AppName','datetime'])
+B = feats_infer[mask_pred][common_cols].sort_values(['AppName','datetime'])
+
+for c in common_cols:
+    if not np.allclose(A[c].values, B[c].values, equal_nan=True, rtol=0, atol=1e-8):
+        diff = np.nanmean(np.abs(A[c].values - B[c].values))
+        parity.append((c, diff))
+
+print("Non-identical feature columns, with mean abs diff:")
+for c, d in parity:
+    print(f"{c}: {d:.6g}")
+# If any feature shows up with a nonzero diff, its calculation path or input reference is not truly identical between train and inference modes and needs to be fixed.
+
+# 2. SHAP Attribution Diff on the 00:00 Hour
+# Goal: Pinpoint which features most suppress or boost the prediction at inference, versus a similar point in training—explains why predictions are low/high.
+
+
+import shap
+
+predict_X = feats_infer.loc[(feats_infer['datetime'] == pd.to_datetime('2025-06-19 00:00:00')), model_features]
+train_X = feats_train.loc[(feats_train['datetime'] == pd.to_datetime('2025-06-12 00:00:00')), model_features].iloc[[0]]  # any similar date
+
+explainer = shap.TreeExplainer(lgbm_model)
+shap_pred = explainer.shap_values(predict_X)
+shap_train = explainer.shap_values(train_X)
+
+print("TOP 10 absolute SHAP for inference hour:")
+for v, c in sorted(zip(np.abs(shap_pred[0]), predict_X.columns), reverse=True)[:10]:
+    print(f"{c}: {v:.2f} (feature={predict_X.iloc[0][c]})")
+
+print("TOP 10 absolute SHAP for similar training hour:")
+for v, c in sorted(zip(np.abs(shap_train[0]), train_X.columns), reverse=True)[:10]:
+    print(f"{c}: {v:.2f} (feature={train_X.iloc[0][c]})")
+# Interpretation: The columns with highest magnitude are what drive the model to under/over-predict. Differences between training and inference values here flag drifted feature definitions or NaN handling.
+
+# 3. Recursive Loop Guards (Hour-by-Hour)
+# Goal: In recursive inference, ensure only hourly features are updated using prior predictions—daily/weekly/global stats must remain frozen to history.
+
+# Core logic (pseudocode/structure):
+
+
+# Assume safe_daily_features & safe_weekly_features were already called with last_known_date
+work = history_df.copy()
+predictions = []
+
+for h in pd.date_range('2025-06-19 00:00', periods=24, freq='H'):
+    # Construct 1-row placeholder for this hour
+    row = pd.DataFrame({
+        'datetime': [h],
+        'AppName': ['my_app'],
+        'transactions': [0],  # or np.nan for placeholder
+    })
+    # Append to work; recompute only hourly features using shift(1) (do NOT recompute daily/weekly/global)
+    sim_rows = pd.concat([work, row], ignore_index=True)
+    features = compute_hourly_only_features(sim_rows, last_known=your_last_ts)
+    X = features.loc[features['datetime'] == h, model_features]
+    y_pred = lgbm_model.predict(X)
+    predictions.append(dict(datetime=h, pred=y_pred[0]))
+    # Update work with NEW prediction as "transactions"
+    row['transactions'] = y_pred[0]
+    work = pd.concat([work, row], ignore_index=True)
+# The function compute_hourly_only_features should not update any daily/weekly fields or STL/residuals; only hourly lags/rollings.
+
+# 4. Quick "Model Diagnostics" Script
+# Goal: Summary of feature coverage, stats, and known drifts at inference.
+
+# After inference features are built
+mask_pred = feats_infer['datetime'].dt.date == pd.to_datetime('2025-06-19').date()
+df_test = feats_infer[mask_pred][model_features]
+
+print("NaN fraction (should be near zero, except as expected):")
+print(df_test.isna().mean().sort_values(ascending=False))
+
+print("\nMin/max of model features (should be in sensible ranges):")
+print(df_test.describe().T[['min', 'max']])
+
+# Compare to training
+df_train_sample = feats_train[model_features].sample(n=min(1000,len(feats_train)), random_state=42)
+print("\nPrediction day z-score (outside training 1st-99th percentile):")
+for c in model_features:
+    lo, hi = df_train_sample[c].quantile([0.01, 0.99])
+    pred_vals = df_test[c].values
+    pct_outliers = np.mean((pred_vals<lo) | (pred_vals>hi))
+    if pct_outliers > 0.2:
+        print(f"{c}: {pct_outliers:.2%} of inference day outside training range")
+
+print("\nMean/median prediction for day:")
+print(df_test.shape[0], "rows; Predicted mean:", feats_infer.loc[mask_pred, 'prediction'].mean())
