@@ -2346,3 +2346,8 @@ for c in model_features:
 
 print("\nMean/median prediction for day:")
 print(df_test.shape[0], "rows; Predicted mean:", feats_infer.loc[mask_pred, 'prediction'].mean())
+
+
+# vscode extensions
+https://marketplace.visualstudio.com/_apis/public/gallery/publishers/GitHub/vsextensions/copilot/latest/vspackage
+https://marketplace.visualstudio.com/_apis/public/gallery/publishers/GitHub/vsextensions/copilot-chat/latest/vspackage
